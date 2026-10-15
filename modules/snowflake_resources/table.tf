@@ -1,24 +1,26 @@
 resource "snowflake_table" "demo_table" {
-  database   = snowflake_database.tf_demo_database.name
-  schema     = snowflake_schema.tf_demo_schema.name
-  depends_on = [snowflake_table_grant.table_ro_grant]
-  name       = "DEMO_TABLE"
-  comment    = "An empty table for Terraform demo"
+  database = snowflake_schema.tf_demo_schema.database
+  schema   = snowflake_schema.tf_demo_schema.name
+  name     = "DEMO_TABLE"
+  comment  = "An empty table for the Terraform demo"
+
+  # Created after the future grant, so the reader role can SELECT it at once.
+  depends_on = [snowflake_grant_privileges_to_account_role.future_tables_select]
 
   column {
-    name     = "id"
+    name     = "ID"
     type     = "NUMBER(38,0)"
     nullable = true
   }
 
   column {
-    name     = "data"
-    type     = "text"
+    name     = "DATA"
+    type     = "VARCHAR(16777216)"
     nullable = false
   }
 
   column {
-    name = "DATE"
+    name = "CREATED_AT"
     type = "TIMESTAMP_NTZ(9)"
   }
 }

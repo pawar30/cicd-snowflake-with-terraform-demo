@@ -1,27 +1,34 @@
 terraform {
+  required_version = ">= 1.5.0"
+
   required_providers {
     snowflake = {
-      source  = "Snowflake-Labs/snowflake"
-      version = "0.63.0"
+      source  = "snowflakedb/snowflake"
+      version = "~> 2.22"
     }
   }
 
-  backend "s3" {
-    bucket         = "<your-bucket-name>"
-    key            = "terraform-prod.tfstate"
-    region         = "<bucket-region>"
-    # Optional DynamoDB for state locking. See https://developer.hashicorp.com/terraform/language/settings/backends/s3 for details.
-    # dynamodb_table = "terraform-state-lock-table"
-    encrypt        = true
-    role_arn       = "arn:aws:iam::<your-aws-account-no>:role/<terraform-s3-backend-access-role>"
+  # State lives in Azure Blob Storage. The pipeline reaches it with its Entra
+  # identity via GitHub OIDC, so no storage keys are needed. The storage
+  # account name is passed in by the workflow (-backend-config).
+  backend "azurerm" {
+    container_name   = "tfstate"
+    key              = "snowflake-demo-prod.tfstate"
+    use_oidc         = true
+    use_azuread_auth = true
   }
 }
 
+# Logs in to Snowflake with an Entra access token (External OAuth).
+# The pipeline sets these environment variables before running Terraform:
+#   SNOWFLAKE_TOKEN             - fresh token from Entra, valid ~1 hour
+#   SNOWFLAKE_USER              - LOGIN_NAME of the deploy user (Entra object ID)
+#   SNOWFLAKE_ORGANIZATION_NAME - Snowflake organization name
+#   SNOWFLAKE_ACCOUNT_NAME      - Snowflake account name
 provider "snowflake" {
-  username    = "<your_snowflake_username>"
-  account     = "<your_snowflake_account_identifier>"
-  role        = "<your_snowflake_role>"
-  private_key = var.snowflake_private_key
+  authenticator            = "OAUTH"
+  role                     = "TF_DEPLOY_ROLE"
+  preview_features_enabled = ["snowflake_table_resource"]
 }
 
 module "snowflake_resources" {
