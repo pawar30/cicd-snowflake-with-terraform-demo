@@ -1,48 +1,72 @@
-# CI/CD pipeline with Snowflake
-Demo of a simple CI/CD pipeline deployed onto Snowflake with Terraform
+# CI/CD pipeline with Snowflake (Entra ID auth, no key pair)
+Demo of a CI/CD pipeline that deploys Snowflake objects with Terraform from GitHub Actions.
 
-[![PRODUCTION ENV: Snowflake Terraform Demo Workflow](https://github.com/sfc-gh-sekim/cicd-snowflake-with-terraform-demo/actions/workflows/snowflake-terraform-demo-prod.yml/badge.svg)](https://github.com/sfc-gh-sekim/cicd-snowflake-with-terraform-demo/actions/workflows/snowflake-terraform-demo-prod.yml)
-[![STAGING ENV: Snowflake Terraform Demo Workflow](https://github.com/sfc-gh-sekim/cicd-snowflake-with-terraform-demo/actions/workflows/snowflake-terraform-demo-staging.yml/badge.svg)](https://github.com/sfc-gh-sekim/cicd-snowflake-with-terraform-demo/actions/workflows/snowflake-terraform-demo-staging.yml)
+Adapted from the original key-pair/AWS demo so that **no secret is stored anywhere**:
 
-![diagram](./docs/cicd_flow_diagram.png)
+| Concern | Original | This version |
+| --- | --- | --- |
+| Snowflake login | RSA key pair (`SNOWFLAKE_PRIVATE_KEY` secret) | Entra ID access token via Snowflake **External OAuth** |
+| Terraform state | AWS S3 + AWS access keys | **Azure Blob Storage**, reached with the job's Entra identity (OIDC) |
+| Provider | `Snowflake-Labs/snowflake` 0.63 | `snowflakedb/snowflake` ~> 2.22 |
 
-## Prerequisites 
+## How a run logs in
+1. GitHub gives the job a signed OIDC token ("this repo, this branch / PR").
+2. `azure/login` exchanges it with Entra through a **federated credential** on the `gh-terraform-snowflake` app.
+3. `az account get-access-token` gets a ~1-hour token for the `snowflake-oauth-resource` app, carrying `session:role:TF_DEPLOY_ROLE`.
+4. Terraform passes the token to Snowflake (`authenticator = "OAUTH"`). Snowflake's External OAuth integration validates it and maps `sub` to user `TF_DEPLOY_SVC`.
+5. The azurerm backend uses the same GitHub OIDC token to read and write state in Azure Storage.
 
-### Snowflake
+## Pipelines
+| Workflow | Trigger | Does |
+| --- | --- | --- |
+| `snowflake-terraform-demo-prod.yml` | PR into `main` | plan, posted as a PR comment |
+| `snowflake-terraform-demo-prod.yml` | push / merge to `main` | apply to PROD |
+| `snowflake-terraform-demo-staging.yml` | push to `staging` (or manual) | plan + apply to STAGING |
 
-You will need a Snowflake account, along with a user with `ACCOUNTADMIN` role. In a true production setting consider setting up a role with least privilege permissions.
+## What gets created (per environment)
+- Database `TERRAFORM_DEMO_PROD` / `TERRAFORM_DEMO_STAGING`, schema `TF_DEMO`, table `DEMO_TABLE`
+- Warehouse `TF_DEMO_WH` / `TF_DEMO_WH_STAGING` (XSMALL, auto-suspend 60 s)
+- Role `TF_DEMO_READER` / `TF_DEMO_READER_STAGING` (granted to SYSADMIN) with USAGE on the database, schema and warehouse, and SELECT on future tables and views
 
-Key pair authentication is used to authenticate to Snowflake. Checkout the [official docs](https://docs.snowflake.com/en/user-guide/key-pair-auth#configuring-key-pair-authentication) for instructions on setting up key pair authentication for a user.
+## One-time setup
 
-#### TF_DEMO_READER Role
+### 1. Entra ID (already done if you followed the Entra PoC)
+- App `snowflake-oauth-resource`: Application ID URI `api://<id>`, app role `session:role:TF_DEPLOY_ROLE` (Applications)
+- App `gh-terraform-snowflake`: Application permission to that role, admin consent granted
+- **Federated credentials on `gh-terraform-snowflake` for THIS repo.** Each one matches exactly one entity:
 
-This Terraform project creates grants for a `TF_DEMO_READER` custom role, which is not created or managed by Terraform in this case. To create this in your Snowflake account before deploying:
+| Name | Entity type | Value |
+| --- | --- | --- |
+| `demo-main` | Branch | `main` |
+| `demo-pr` | Pull request | (none) |
+| `demo-staging` | Branch | `staging` |
 
-```
-create role TF_DEMO_READER;
+Fill in Organization ID and Repository ID in the form so Entra builds GitHub's ID-based subject.
 
---Grant to this to a user of your choice
-grant role TF_DEMO_READER to user MY_ROLE;
-```
+### 2. Snowflake (already done if you followed the Entra PoC)
+`TF_DEPLOY_ROLE` (with SYSADMIN + SECURITYADMIN), user `TF_DEPLOY_SVC` with `LOGIN_NAME = <service principal object id>`, and an `EXTERNAL_OAUTH` security integration of type AZURE.
 
-### Terraform
+### 3. Azure Storage for Terraform state
+1. Create a resource group, e.g. `rg-tfstate-poc`.
+2. Create a storage account (Standard, LRS), e.g. `sttfstate<unique>`.
+3. Create a private container named `tfstate`.
+4. On the storage account, open **Access control (IAM)** → add role **Storage Blob Data Contributor** → assign it to the `gh-terraform-snowflake` service principal.
 
-If you'd like to develop locally, you can install terraform. See instructions for your platform [here](https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli)
+### 4. GitHub repository variables
+Settings → Secrets and variables → Actions → **Variables**. These are all identifiers, not secrets.
 
+| Variable | Value |
+| --- | --- |
+| `AZURE_TENANT_ID` | Entra tenant ID |
+| `AZURE_CLIENT_ID` | Application (client) ID of `gh-terraform-snowflake` |
+| `AZURE_SUBSCRIPTION_ID` | Subscription that holds the storage account |
+| `SF_RESOURCE_APP_ID` | Application (client) ID of `snowflake-oauth-resource` |
+| `SNOWFLAKE_ORGANIZATION_NAME` | Snowflake organization name |
+| `SNOWFLAKE_ACCOUNT_NAME` | Snowflake account name |
+| `SNOWFLAKE_USER` | `LOGIN_NAME` of `TF_DEPLOY_SVC` (the Entra object ID, not the user name) |
+| `TFSTATE_STORAGE_ACCOUNT` | Storage account name from step 3 |
 
-### Github Actions
+No repository **secrets** are needed. Delete `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `SNOWFLAKE_PRIVATE_KEY` if they exist.
 
-If you'd like to see Github actions workflow in action, fork this repository.
-
-#### Secrets
-
-The Github Actions workflows authenticate to Snowflake via secrets uploaded to Github Actions. On your forked repo, set up the following Repository Secrets:
-
-- AWS_ACCESS_KEY_ID: For authenticating with AWS
-- AWS_SECRET_ACCESS_KEY: For authenticating with AWS
-- SNOWFLAKE_PRIVATE_KEY: This is your private key you use to authenticate to Snowflake via key-pair authentication
-
-
-
-
-
+## Local development
+Install Terraform, then run `terraform fmt -recursive` and `terraform -chdir=staging init -backend=false && terraform -chdir=staging validate` before pushing.
