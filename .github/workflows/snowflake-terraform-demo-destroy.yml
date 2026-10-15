@@ -1,0 +1,70 @@
+name: "DESTROY: Snowflake Terraform Demo (manual)"
+
+# Manual only. Run it from the main branch (Actions -> this workflow -> Run workflow).
+# Drops everything Terraform created in the chosen environment, nothing else.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      confirm:
+        description: "Type DESTROY to confirm"
+        required: true
+        type: string
+
+permissions:
+  id-token: write # lets the job ask GitHub for its OIDC token (Entra + Azure Storage)
+  contents: read
+
+concurrency:
+  group: terraform-${{ inputs.environment }} # never runs at the same time as a deploy of that env
+  cancel-in-progress: false
+
+env:
+  TF_DIR: ./${{ inputs.environment }}
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  SNOWFLAKE_ORGANIZATION_NAME: ${{ vars.SNOWFLAKE_ORGANIZATION_NAME }}
+  SNOWFLAKE_ACCOUNT_NAME: ${{ vars.SNOWFLAKE_ACCOUNT_NAME }}
+  SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+
+jobs:
+  destroy:
+    name: "Destroy ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    if: inputs.confirm == 'DESTROY' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Entra (federated credential, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Get Snowflake access token from Entra
+        run: |
+          TOKEN=$(az account get-access-token --scope "api://${{ vars.SF_RESOURCE_APP_ID }}/.default" --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform -chdir=$TF_DIR init -input=false -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+
+      - name: Show what will be destroyed
+        run: terraform -chdir=$TF_DIR plan -destroy -no-color -input=false
+
+      - name: Terraform Destroy
+        run: terraform -chdir=$TF_DIR destroy -auto-approve -input=false
